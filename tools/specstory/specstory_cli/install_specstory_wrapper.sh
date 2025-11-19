@@ -83,7 +83,7 @@ EOF
 
   echo "✔ Hook installed for environment: $ENV_NAME"
   echo "➡ When you run:  conda activate $ENV_NAME"
-  echo "   The alias 'claude' will route through specstory."
+  echo "   The alias 'claude' will route through specstory. Please note that "claude" cannot accept arguments."
 fi
 
 echo
