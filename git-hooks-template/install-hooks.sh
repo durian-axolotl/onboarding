@@ -6,7 +6,8 @@
 set -euo pipefail
 
 # Get the directory where this script is located
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 # Check if we're in a git repository
 if ! git rev-parse --git-dir >/dev/null 2>&1; then
@@ -24,7 +25,7 @@ mkdir -p "$HOOKS_DIR"
 # Install the hooks
 echo "Installing AI-blocking git hooks..."
 
-for hook in commit-msg pre-commit pre-push; do
+for hook in commit-msg pre-commit; do
   # if [[ -f "$HOOKS_DIR/$hook" ]]; then
   #   # echo "  Warning: $hook already exists"
   #   # mv "$HOOKS_DIR/$hook" "$HOOKS_DIR/$hook.backup"
@@ -41,6 +42,5 @@ echo ""
 echo "The following hooks are now active:"
 echo "  • commit-msg  - Blocks AI indicators in commit messages"
 echo "  • pre-commit  - Blocks AI indicators in staged file contents"
-echo "  • pre-push    - Final safety check before pushing"
 echo ""
 echo "To uninstall, simply delete the hooks from $HOOKS_DIR"

@@ -108,32 +108,62 @@ PATTERN_REGEX=${PATTERN_REGEX%|}
 BINARY_PATHS=""
 while IFS=$'\t' read -r added deleted path; do
   [[ -z "${path:-}" ]] && continue
+  if [[ "$path" == *" -> "* ]]; then
+    path=${path##* -> }
+  fi
   if [[ "$added" == "-" || "$deleted" == "-" ]]; then
     BINARY_PATHS="${BINARY_PATHS}${path}"$'\n'
   fi
 done < <(git diff --cached --numstat --diff-filter=ACMRT || true)
 
-violations=0
 report=""
+current_file=""
+last_report_file=""
+violations=0
 
-while IFS= read -r -d '' file; do
-  [[ -z "${file:-}" ]] && continue
-  # Skip binary files by checking if path is in BINARY_PATHS
-  if [[ -n "$BINARY_PATHS" ]] && echo "$BINARY_PATHS" | grep -qxF "$file"; then
-    continue
-  fi
+while IFS= read -r line; do
+  case "$line" in
+    "diff --git "*)
+      current_file=""
+      ;;
+    "+++ "*)
+      current_file=${line#+++ }
+      if [[ "$current_file" == b/* ]]; then
+        current_file=${current_file#b/}
+      elif [[ "$current_file" == a/* ]]; then
+        current_file=${current_file#a/}
+      fi
+      if [[ "$current_file" == "/dev/null" ]]; then
+        current_file=""
+      fi
+      ;;
+    "Binary files "*)
+      current_file=""
+      ;;
+    *)
+      if [[ "$line" == +* && "$line" != "+++"* ]]; then
+        [[ -z "$current_file" ]] && continue
+        if [[ -n "$BINARY_PATHS" ]] && echo "$BINARY_PATHS" | grep -qxF "$current_file"; then
+          continue
+        fi
+        content=${line:1}
+        if [[ -n "$content" ]] && LC_ALL=C grep -qiE "$PATTERN_REGEX" <<<"$content"; then
+          if [[ "$current_file" != "$last_report_file" ]]; then
+            report+=$'\n'"• $current_file"
+            last_report_file="$current_file"
+          fi
+          report+=$'\n'"  ${line}"
+          violations=1
+        fi
+      fi
+      ;;
+  esac
+done < <(git diff --cached --diff-filter=ACMRT --unified=0 --no-color)
 
-  matches=$(git show ":$file" | LC_ALL=C grep -n -i -E "$PATTERN_REGEX" || true)
-  if [[ -n "$matches" ]]; then
-    ((violations++))
-    report+=$'\n'"• $file"$'\n'"$matches"$'\n'
-  fi
-done < <(git diff --cached --name-only --diff-filter=ACMRT -z)
-
-if (( violations > 0 )); then
+if [[ $violations -eq 1 ]]; then
   cat >&2 <<EOF
-✖ Commit blocked: staged changes contain AI usage indicators.
-Please remove or rephrase the highlighted lines before committing:$report
+✖ Commit blocked: staged changes contain AI usage indicators in the current diff.
+Please remove or rephrase the highlighted additions before committing:$report
 EOF
   exit 1
 fi

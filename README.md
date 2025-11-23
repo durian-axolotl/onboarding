@@ -85,7 +85,7 @@ To help you avoid accidentally committing AI indicators, we've created git hooks
 
 ### Installation
 
-To install the hooks, run the provided script from the root of your repository. See `git-hooks-template/README.md` for more details.
+To install the hooks, run the provided script from the root of your repository. See `git-hooks-template/README.md` for more details. Note that these hooks are **repository-specific** and must be installed in each repo where you want them active
 
 - Install: `bash git-hooks-template/install-hooks.sh`
 - Reference: `git-hooks-template/README.md`
@@ -94,6 +94,8 @@ The installer will activate three hooks:
 
 - **commit-msg** - Blocks AI indicators in commit messages
 - **pre-commit** - Blocks AI indicators in staged file contents
+
+> Reminder to update your [status](https://forms.gle/SLXdJk3SbjHCYnpd9) once you have completed this step.
 
 ## 6) Practice Tasks
 
