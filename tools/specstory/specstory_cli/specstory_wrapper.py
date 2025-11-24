@@ -11,7 +11,13 @@ import signal
 import json
 from typing import List, Optional
 
-REAL = "/opt/homebrew/bin/specstory-real"
+# brew --prefix specstory, then join with bin/specstory-real
+prefix = subprocess.check_output(
+    ["brew", "--prefix"],
+    text=True,
+    stderr=subprocess.DEVNULL
+).strip()
+REAL = os.path.join(prefix, "bin", "specstory-real")
 HIST_DIR = ".specstory/history"
 TS_DIR = ".specstory/timestamps"
 
@@ -333,8 +339,9 @@ def main():
     if os.path.exists(pidfile):
         with open(pidfile, 'r') as f:
             content = f.read().strip()
-        meta = json.loads(content)
-        target_md = meta.get("target")
+        if content:
+            meta = json.loads(content)
+            target_md = meta.get("target")
 
     # Stop the watcher before modifying the markdown so it doesn't record the merge
     stop_watcher()

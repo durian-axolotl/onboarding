@@ -17,7 +17,26 @@ You can make your account in any way that works for you, but here’s a simple m
 
 > Once you're finished, update your [status](https://forms.gle/SLXdJk3SbjHCYnpd9) and continue onto the the next step.
 
-## 2) Install AI Coding Tools
+## 2) Set Up Screen Recording Tool
+
+For this study, we’ll be using a custom screen recorder to capture your coding sessions. The tool helps you choose exactly which windows you’re comfortable sharing and records only high-signal activity related to your interactions.
+
+Please create a conda environment to set up the recording tool. This should be the same conda environment you use for setting up SpecStory.
+
+### Installation
+
+Please install and run the recorder from the following repository:
+https://github.com/jennjwang/swe-prod-recorder
+
+A visual walkthrough for the setup process is available [here](https://docs.google.com/document/d/1kcVAi28N4hAu_FuuRBffViv0rwcA2tny7jCBvH-0zyI/edit?tab=t.r88ylnapzh5a#heading=h.lmf23ws57a4n)
+
+### Storage Options
+
+Because screen recordings can take up a lot of storage (~300 mb per hour), we provide the option for your to upload recordings directly to your Google Drive. You can find the setup instructions [here](https://docs.google.com/document/d/1kcVAi28N4hAu_FuuRBffViv0rwcA2tny7jCBvH-0zyI/edit?tab=t.cqbysjja5sff).
+
+> Reminder to update your [completion status](https://forms.gle/SLXdJk3SbjHCYnpd9) once you have completed this step.
+
+## 3) Install AI Coding Tools
 
 You’ll use both Cursor and Claude Code during the study. For each tool, we provide (1) a setup guide for installation and configuration, and (2) a quickstart based on the official documentation that introduces key features and functionality.
 
@@ -41,23 +60,6 @@ To set up Claude Code, follow the instructions provided [here](https://docs.goog
 
 > Reminder to update your [status](https://forms.gle/SLXdJk3SbjHCYnpd9) once you have completed this step.
 
-## 3) Set Up Screen Recording Tool
-
-For this study, we’ll be using a custom screen recorder to capture your coding sessions. The tool helps you choose exactly which windows you’re comfortable sharing and records only high-signal activity related to your interactions.
-
-### Installation
-
-Please install and run the recorder from the following repository:
-https://github.com/jennjwang/swe-prod-recorder
-
-A visual walkthrough for the setup process is available [here](https://docs.google.com/document/d/1kcVAi28N4hAu_FuuRBffViv0rwcA2tny7jCBvH-0zyI/edit?tab=t.r88ylnapzh5a#heading=h.lmf23ws57a4n)
-
-### Storage Options
-
-Because screen recordings can take up a lot of storage (~300 mb per hour), we provide the option for your to upload recordings directly to your Google Drive. You can find the setup instructions [here](https://docs.google.com/document/d/1kcVAi28N4hAu_FuuRBffViv0rwcA2tny7jCBvH-0zyI/edit?tab=t.cqbysjja5sff).
-
-> Reminder to update your [completion status](https://forms.gle/SLXdJk3SbjHCYnpd9) once you have completed this step.
-
 ## 4) Install AI Usage Logger (SpecStory)
 
 We’ll also be tracking your AI usage as part of this study. [SpecStory](https://specstory.com/) is a Cursor extension and CLI tool that automatically records your AI-assisted coding activity as local Markdown files.
@@ -73,15 +75,40 @@ Install both components following the SpecStory installation guide ([Google Doc]
 
 ### Verification
 
-Verify that SpecStory is logging correctly by running a short AI interaction and then checking the .specstory/history/ folder for a newly created Markdown file. Open the file to confirm that it contains the recent requests and responses from your interaction.
+Verify that SpecStory is logging correctly by running a short AI interaction and then checking the .specstory/history/ folder for a newly created Markdown file. Open the file to confirm that it contains the recent requests and responses from your interaction along with event timestamps.
 
 > Reminder to update your [status](https://forms.gle/SLXdJk3SbjHCYnpd9) once you have completed this step.
 
-## 5) Practice Tasks
+## 5) Install Git Hooks
+
+We provide a `pre-commit` configuration that blocks explicit AI indicators in both your staged changes and commit messages. The guard looks for tool names (Claude, Cursor, Copilot, Gemini, etc.), phrases such as “ai-generated,” and co-authorship markers so reviewers stay blinded to AI usage.
+
+### Installation
+
+Run the following from the repository root (install `pre-commit` first if you don’t already have it):
+
+```bash
+pip install pre-commit            # or use pipx/brew as you prefer
+# ensure the guard script is executable (only needed once per clone)
+chmod +x .config/ai-hooks/ai_guard.py
+pre-commit install
+```
+
+To validate the hooks are active:
+
+```bash
+pre-commit run --all-files
+```
+
+Behind the scenes both hooks call `.config/ai-hooks/ai_guard.py`, so updates to the guard logic propagate everywhere automatically. For more details, see `/.config/ai-hooks/README.md`
+
+> Reminder to update your [status](https://forms.gle/SLXdJk3SbjHCYnpd9) once you have completed this step.
+
+## 6) Practice Tasks
 
 We’ve set up a small project in `playground` that provides a more detailed guided tour of both Claude Code and Cursor. The project is a simple unit-conversion toolkit (temperature, distance, weight) with a CLI, dispatcher, and test suite designed specifically for experimentation.
 
-### Setup
+### Set Up
 
 Start by forking this repository using your anonymous GitHub account and cloning your fork locally. While working in this project, please keep both the screen recorder and SpecStory running at all times.
 
@@ -93,14 +120,14 @@ Please use AI freely throughout the tasks; however, because reviewers are blinde
 - Boilerplate phrases like “As an AI assistant, I…”
 - Tags or markers such as `[AI]`, `[Cursor]`, `[Claude]`
 
-Git hooks will catch common markers, but please double-check your changes before committing.
+The git hooks will catch common markers, but please double-check your changes before committing.
 
 ### Completion
 
 Once you have completed the practice tasks, please submit the [onboarding form] (https://forms.gle/SLXdJk3SbjHCYnpd9) with the following artifacts:
 
-- A zipped copy of your `.specstory folder` from this repo
-- A zipped copy of the `/data` folder from your screen recorder directory
+- A zipped copy of your `.specstory folder` from this repo.
+- A zipped copy of the `/data` folder from your screen recorder directory.
 - A link to your forked repository with all changes committed and pushed.
 
 Once we receive your submission, we’ll know you’re ready for the main study and follow up with next steps. Thank you for your participation!
