@@ -11,13 +11,50 @@ import signal
 import json
 from typing import List, Optional
 
-# brew --prefix specstory, then join with bin/specstory-real
-prefix = subprocess.check_output(
-    ["brew", "--prefix"],
-    text=True,
-    stderr=subprocess.DEVNULL
-).strip()
-REAL = os.path.join(prefix, "bin", "specstory-real")
+# Dynamically find specstory-real, handling homebrew upgrades
+def find_real_specstory():
+    """Find the real specstory binary, handling homebrew version changes."""
+    try:
+        prefix = subprocess.check_output(
+            ["brew", "--prefix"],
+            text=True,
+            stderr=subprocess.DEVNULL
+        ).strip()
+        real_path = os.path.join(prefix, "bin", "specstory-real")
+
+        # If specstory-real exists and is valid, use it
+        if os.path.exists(real_path):
+            # Check if it's a broken symlink
+            if os.path.islink(real_path):
+                try:
+                    os.stat(real_path)  # Will raise if symlink is broken
+                    return real_path
+                except OSError:
+                    # Broken symlink, fix it
+                    pass
+            else:
+                return real_path
+
+        # specstory-real doesn't exist or is broken, find the current version
+        specstory_path = subprocess.check_output(
+            ["brew", "--prefix", "specstory"],
+            text=True,
+            stderr=subprocess.DEVNULL
+        ).strip()
+
+        real_bin = os.path.join(specstory_path, "bin", "specstory")
+
+        # Create/update the specstory-real symlink
+        if os.path.exists(real_path) or os.path.islink(real_path):
+            os.remove(real_path)
+        os.symlink(real_bin, real_path)
+
+        return real_path
+    except Exception as e:
+        # Fallback: try to find specstory-real in PATH
+        return "specstory-real"
+
+REAL = find_real_specstory()
 HIST_DIR = ".specstory/history"
 TS_DIR = ".specstory/timestamps"
 
