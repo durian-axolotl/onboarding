@@ -1,89 +1,469 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
+
+# ============================================================================
+# Configuration and State Tracking
+# ============================================================================
+
+# Track installation state for cleanup on interrupt
+SYMLINK_CREATED=false
+WRAPPER_CREATED=false
+PYTHON_SCRIPT_COPIED=false
+PROFILE_MODIFIED=()
+VENV_HOOKS_ADDED=()
+
+# Constants
+WRAPPER_DIR="$HOME/.specstory_wrapper"
+WRAPPER_BIN="$HOME/bin/specstory"
+CLAUDE_WRAPPER_BIN="$HOME/bin/claude"
+PYTHON_WRAPPER="$WRAPPER_DIR/specstory_wrapper.py"
+PATH_EXPORT='export PATH="$HOME/bin:$PATH"'
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Safely remove a file or directory
+safe_remove() {
+  local target="$1"
+  [[ -e "$target" ]] && rm -rf "$target" 2>/dev/null || true
+}
+
+# Restore profile file by removing PATH export line
+restore_profile() {
+  local profile="$1"
+  if [[ -f "$profile" ]] && [[ -s "$profile" ]]; then
+    # Use temp file to safely remove line; preserve file if grep finds nothing
+    if grep -v "^${PATH_EXPORT}$" "$profile" > "${profile}.tmp" 2>/dev/null; then
+      mv "${profile}.tmp" "$profile" 2>/dev/null || true
+    fi
+    rm -f "${profile}.tmp" 2>/dev/null || true
+  fi
+}
+
+# Remove venv hook sections from a script file
+remove_venv_hooks() {
+  local hook_file="$1"
+  if [[ ! -f "$hook_file" ]]; then
+    return
+  fi
+
+  # Remove hook sections
+  # macOS sed requires backup extension, Linux doesn't - use empty string for macOS
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    sed -i '' \
+      -e '/# SPECSTORY HOOK START/,/# SPECSTORY HOOK END/d' \
+      -e '/# SPECSTORY DEACTIVATE HOOK/,/unset -f claude/d' \
+      -e '/# SPECSTORY DEACTIVATE HOOK/,/unalias claude/d' \
+      -e '/^[[:space:]]*# SPECSTORY DEACTIVATE HOOK$/d' \
+      -e '/^[[:space:]]*unset -f claude 2>\/dev\/null || true$/d' \
+      -e '/^[[:space:]]*unalias claude 2>\/dev\/null || true$/d' \
+      "$hook_file" 2>/dev/null || true
+  else
+    sed -i \
+      -e '/# SPECSTORY HOOK START/,/# SPECSTORY HOOK END/d' \
+      -e '/# SPECSTORY DEACTIVATE HOOK/,/unset -f claude/d' \
+      -e '/# SPECSTORY DEACTIVATE HOOK/,/unalias claude/d' \
+      -e '/^[[:space:]]*# SPECSTORY DEACTIVATE HOOK$/d' \
+      -e '/^[[:space:]]*unset -f claude 2>\/dev\/null || true$/d' \
+      -e '/^[[:space:]]*unalias claude 2>\/dev\/null || true$/d' \
+      "$hook_file" 2>/dev/null || true
+  fi
+}
+
+# ============================================================================
+# Cleanup Function
+# ============================================================================
+
+cleanup_on_interrupt() {
+  echo
+  echo "⚠ Installation interrupted. Cleaning up..."
+
+  # Remove symlink if it was created
+  if [[ "$SYMLINK_CREATED" == "true" ]]; then
+    echo "  Removing specstory-real symlink..."
+    safe_remove "$HOME/bin/specstory-real"
+  fi
+
+  # Remove wrapper if it was created
+  if [[ "$WRAPPER_CREATED" == "true" ]]; then
+    echo "  Removing wrapper binaries..."
+    safe_remove "$WRAPPER_BIN"
+    safe_remove "$CLAUDE_WRAPPER_BIN"
+  fi
+  
+  # Remove Python script if it was copied
+  if [[ "$PYTHON_SCRIPT_COPIED" == "true" ]]; then
+    echo "  Removing Python wrapper script..."
+    safe_remove "$PYTHON_WRAPPER"
+    rmdir "$WRAPPER_DIR" 2>/dev/null || true
+  fi
+  
+  # Restore profile files
+  for profile in "${PROFILE_MODIFIED[@]}"; do
+    echo "  Restoring $profile..."
+    restore_profile "$profile"
+  done
+  
+  # Remove venv hooks
+  for hook_file in "${VENV_HOOKS_ADDED[@]}"; do
+    echo "  Removing venv hook: $hook_file..."
+    if [[ "$hook_file" == *.sh ]]; then
+      safe_remove "$hook_file"
+    elif [[ "$hook_file" == */activate ]] || [[ "$hook_file" == */deactivate ]]; then
+      remove_venv_hooks "$hook_file"
+    fi
+  done
+  
+  echo "  Cleanup complete. No changes were made."
+  exit 130
+}
+
+# Set up trap for Ctrl+C (SIGINT)
+trap cleanup_on_interrupt INT
+
+# ============================================================================
+# Main Installation
+# ============================================================================
 
 echo "Installing Specstory wrapper..."
 
-# --- 1. Locate real specstory binary ---
-REAL_BIN="$(command -v specstory || true)"
-if [[ -z "$REAL_BIN" ]]; then
-  echo "Specstory not found in PATH. Install it first (brew install specstoryai/tap/specstory)."
+# --- Step 0: Pre-flight checks ---
+# Get script directory (works in both bash and zsh)
+# Use BASH_SOURCE if available (bash), otherwise fall back to $0
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+WRAPPER_PY_SOURCE="${SCRIPT_DIR}/specstory_wrapper.py"
+
+if [[ ! -f "$WRAPPER_PY_SOURCE" ]]; then
+  echo "Error: specstory_wrapper.py not found at $WRAPPER_PY_SOURCE"
+  echo "Please run this installer from the directory containing specstory_wrapper.py"
   exit 1
 fi
 
-REAL_DIR="$(dirname "$REAL_BIN")"
-REAL_WRAPPED="$REAL_DIR/specstory-real"
-
-# --- 2. Rename real binary (if not already renamed) ---
-if [[ ! -f "$REAL_WRAPPED" ]]; then
-  echo "➡ Renaming $REAL_BIN → $REAL_WRAPPED"
-  mv "$REAL_BIN" "$REAL_WRAPPED"
-else
-  echo "✔ Real binary already renamed."
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Error: python3 is required but not found in PATH."
+  exit 1
 fi
 
-# --- 3. Install wrapper to ~/bin/specstory ---
-mkdir -p "$HOME/bin"
-WRAPPER_BIN="$HOME/bin/specstory"
+# --- Step 1: Locate real specstory binary ---
+# Helper: check if a file is a wrapper script (not the real binary)
+is_wrapper_script() {
+  local path="$1"
+  [[ ! -f "$path" ]] && return 1
+  # Check if it's a text file containing wrapper references
+  if file "$path" 2>/dev/null | grep -qE "(text|script)"; then
+    if grep -qE "specstory_wrapper|python3.*specstory" "$path" 2>/dev/null; then
+      return 0  # It's a wrapper
+    fi
+  fi
+  return 1  # Not a wrapper
+}
 
-echo "➡ Installing wrapper launcher → $WRAPPER_BIN"
-cat > "$WRAPPER_BIN" <<'EOF'
+SPECSTORY_REAL_PATH=""
+
+# Method 1: Try homebrew (macOS and Linux homebrew)
+if [[ -z "$SPECSTORY_REAL_PATH" ]] && command -v brew >/dev/null 2>&1; then
+  BREW_PREFIX="$(brew --prefix specstory 2>/dev/null)" || true
+  if [[ -n "$BREW_PREFIX" ]] && [[ -x "$BREW_PREFIX/bin/specstory" ]]; then
+    if ! is_wrapper_script "$BREW_PREFIX/bin/specstory"; then
+      SPECSTORY_REAL_PATH="$BREW_PREFIX/bin/specstory"
+      echo "✔ Found specstory via homebrew: $SPECSTORY_REAL_PATH"
+    fi
+  fi
+fi
+
+# Method 2: Check common Linux/system locations
+if [[ -z "$SPECSTORY_REAL_PATH" ]]; then
+  for loc in "/usr/local/bin/specstory" "/usr/bin/specstory" "$HOME/.local/bin/specstory" "$HOME/.cargo/bin/specstory"; do
+    if [[ -x "$loc" ]] && ! is_wrapper_script "$loc"; then
+      SPECSTORY_REAL_PATH="$loc"
+      echo "✔ Found specstory at: $SPECSTORY_REAL_PATH"
+      break
+    fi
+  done
+fi
+
+# Method 3: Search PATH excluding ~/bin (to avoid finding our wrapper)
+if [[ -z "$SPECSTORY_REAL_PATH" ]]; then
+  FILTERED_PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^${HOME}/bin$" | tr '\n' ':' | sed 's/:$//')"
+  FOUND_BIN="$(PATH="$FILTERED_PATH" command -v specstory 2>/dev/null || true)"
+  if [[ -n "$FOUND_BIN" ]] && [[ -x "$FOUND_BIN" ]] && ! is_wrapper_script "$FOUND_BIN"; then
+    SPECSTORY_REAL_PATH="$FOUND_BIN"
+    echo "✔ Found specstory in PATH: $SPECSTORY_REAL_PATH"
+  fi
+fi
+
+if [[ -z "$SPECSTORY_REAL_PATH" ]]; then
+  echo "Error: Could not find real specstory binary."
+  echo "Install it first:"
+  echo "  macOS:  brew install specstoryai/tap/specstory"
+  echo "  Linux:  See https://github.com/specstoryai/specstory for installation"
+  exit 1
+fi
+
+# --- Step 2: Create specstory-real symlink in ~/bin ---
+# This ensures we always have a reliable path to the real binary that survives upgrades
+mkdir -p "$HOME/bin"
+SPECSTORY_REAL_LINK="$HOME/bin/specstory-real"
+
+# Remove existing specstory-real if it's invalid
+if [[ -e "$SPECSTORY_REAL_LINK" ]] || [[ -L "$SPECSTORY_REAL_LINK" ]]; then
+  NEEDS_REPLACE=false
+
+  # Check if it's a wrapper script (invalid)
+  if is_wrapper_script "$SPECSTORY_REAL_LINK"; then
+    echo "➡ Removing invalid specstory-real (wrapper script)"
+    NEEDS_REPLACE=true
+  # Check if it's a broken symlink
+  elif [[ -L "$SPECSTORY_REAL_LINK" ]] && [[ ! -e "$SPECSTORY_REAL_LINK" ]]; then
+    echo "➡ Removing broken specstory-real symlink"
+    NEEDS_REPLACE=true
+  # Check if symlink points to wrong location
+  elif [[ -L "$SPECSTORY_REAL_LINK" ]]; then
+    CURRENT_TARGET="$(readlink "$SPECSTORY_REAL_LINK" 2>/dev/null || true)"
+    if [[ "$CURRENT_TARGET" != "$SPECSTORY_REAL_PATH" ]]; then
+      echo "➡ Updating specstory-real symlink (was: $CURRENT_TARGET)"
+      NEEDS_REPLACE=true
+    fi
+  fi
+
+  if [[ "$NEEDS_REPLACE" == "true" ]]; then
+    rm -f "$SPECSTORY_REAL_LINK"
+  fi
+fi
+
+# Create symlink if it doesn't exist
+if [[ ! -e "$SPECSTORY_REAL_LINK" ]]; then
+  echo "➡ Creating symlink: $SPECSTORY_REAL_LINK → $SPECSTORY_REAL_PATH"
+  ln -sf "$SPECSTORY_REAL_PATH" "$SPECSTORY_REAL_LINK"
+  SYMLINK_CREATED=true
+else
+  echo "✔ specstory-real symlink already valid"
+fi
+
+# Use the symlink as our reference (survives brew upgrades)
+SPECSTORY_REAL_PATH="$SPECSTORY_REAL_LINK"
+
+# --- Step 3: Install wrapper launchers ---
+mkdir -p "$HOME/bin"
+
+# Remove existing specstory wrapper/symlink if present (can't overwrite symlinks with cat)
+if [[ -e "$WRAPPER_BIN" ]] || [[ -L "$WRAPPER_BIN" ]]; then
+  echo "➡ Removing existing $WRAPPER_BIN"
+  rm -f "$WRAPPER_BIN"
+fi
+
+echo "➡ Installing specstory wrapper launcher → $WRAPPER_BIN"
+cat > "$WRAPPER_BIN" <<EOF
 #!/usr/bin/env bash
-python3 "$HOME/.specstory_wrapper/specstory_wrapper.py" "$@"
+# Provide the resolver script the path to the original specstory binary.
+export SPECSTORY_ORIGINAL="$SPECSTORY_REAL_PATH"
+exec python3 "$PYTHON_WRAPPER" "\$@"
 EOF
 
-chmod +x "$WRAPPER_BIN"
-
-# --- 4. Install Python wrapper script ---
-if [[ ! -f "specstory_wrapper.py" ]]; then
-  echo "specstory_wrapper.py not found in the current directory."
-  echo "Please place it next to this installer."
-  exit 1
+# Remove existing claude wrapper/symlink if present
+if [[ -e "$CLAUDE_WRAPPER_BIN" ]] || [[ -L "$CLAUDE_WRAPPER_BIN" ]]; then
+  echo "➡ Removing existing $CLAUDE_WRAPPER_BIN"
+  rm -f "$CLAUDE_WRAPPER_BIN"
 fi
 
-echo "➡ Copying specstory_wrapper.py → ~/.specstory_wrapper/"
-mkdir -p "$HOME/.specstory_wrapper"
-cp specstory_wrapper.py "$HOME/.specstory_wrapper/specstory_wrapper.py"
+echo "➡ Installing claude wrapper launcher → $CLAUDE_WRAPPER_BIN"
+cat > "$CLAUDE_WRAPPER_BIN" <<'EOF'
+#!/usr/bin/env bash
+FILTERED_PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^${HOME}/bin$" | tr '\n' ':' | sed 's/:$//')"
+export PATH="$FILTERED_PATH"
+exec "$HOME/bin/specstory" run claude --no-cloud-sync "$@"
+EOF
 
-if ! echo "$PATH" | grep -q "$HOME/bin"; then
-  echo "➡ Adding ~/bin to PATH in your shell config (bash/zsh)"
+chmod +x "$WRAPPER_BIN" "$CLAUDE_WRAPPER_BIN"
+WRAPPER_CREATED=true
 
-  PROFILE_FILES=()
+# --- Step 4: Install Python wrapper script ---
+echo "➡ Copying specstory_wrapper.py → $WRAPPER_DIR/"
+mkdir -p "$WRAPPER_DIR"
+cp "$WRAPPER_PY_SOURCE" "$PYTHON_WRAPPER"
+PYTHON_SCRIPT_COPIED=true
 
-  # Always consider both common rc files so it works even if you switch shells
-  PROFILE_FILES+=("$HOME/.zshrc" "$HOME/.bashrc")
-
-  # De-duplicate list
-  UNIQUE_PROFILES=()
-  for P in "${PROFILE_FILES[@]}"; do
-    SKIP=false
-    for U in "${UNIQUE_PROFILES[@]}"; do
-      if [[ "$P" == "$U" ]]; then
-        SKIP=true
-        break
-      fi
-    done
-    $SKIP && continue
-    UNIQUE_PROFILES+=("$P")
-  done
-
-  for PROFILE in "${UNIQUE_PROFILES[@]}"; do
-    [[ -z "$PROFILE" ]] && continue
-
-    # Create the profile file if it doesn't exist yet
-    if [[ ! -f "$PROFILE" ]]; then
-      touch "$PROFILE"
-    fi
-
-    if ! grep -q 'export PATH="$HOME/bin:$PATH"' "$PROFILE" 2>/dev/null; then
-      echo "➡ Updating $PROFILE"
-      echo 'export PATH="$HOME/bin:$PATH"' >> "$PROFILE"
+# --- Step 5: Add ~/bin to PATH in shell configs ---
+# We prepend it to ensure our wrappers take priority over system binaries.
+if [[ ":$PATH:" != *":$HOME/bin:"* ]] || [[ "$PATH" != "$HOME/bin:"* ]]; then
+  echo "➡ Ensuring ~/bin is at the start of PATH in shell configs"
+  
+  for profile in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    [[ ! -f "$profile" ]] && touch "$profile"
+    
+    # Remove existing ~/bin exports to avoid duplicates and ensure priority
+    # macOS sed requires backup extension, Linux doesn't - use empty string for macOS
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      sed -i '' '/export PATH="\$HOME\/bin:\$PATH"/d' "$profile"
     else
-      echo "✔ ~/bin already configured in $PROFILE"
+      sed -i '/export PATH="\$HOME\/bin:\$PATH"/d' "$profile"
     fi
+    
+    # Prepend it
+    echo "$PATH_EXPORT" >> "$profile"
+    PROFILE_MODIFIED+=("$profile")
   done
+  echo "✔ ~/bin configured at the end of shell profiles (will be prepended on next shell start)"
 fi
 
-# --- 6. Virtual environment activation hooks ---
+# ============================================================================
+# Virtual Environment Setup
+# ============================================================================
+
+# Hook content templates (functions to generate hook content)
+get_activation_hook() {
+  cat <<'EOF'
+export PATH="$HOME/bin:$PATH"
+# Use function instead of alias for better compatibility
+# Filters $HOME/bin from PATH before calling specstory to avoid infinite recursion
+claude() {
+  local filtered_path
+  filtered_path="$(echo "$PATH" | tr ':' '\n' | grep -v "^${HOME}/bin$" | tr '\n' ':' | sed 's/:$//')"
+  PATH="$filtered_path" specstory run claude --no-cloud-sync "$@"
+}
+EOF
+}
+
+get_deactivation_hook() {
+  cat <<'EOF'
+# Remove claude function if it exists
+unset -f claude 2>/dev/null || true
+EOF
+}
+
+# Create conda hooks
+setup_conda_hooks() {
+  local env_name="$1"
+  local env_path
+  
+  if ! command -v conda >/dev/null 2>&1; then
+    echo "Error: conda not found in PATH."
+    exit 1
+  fi
+
+  # Validate environment name
+  if [[ -z "$env_name" ]] || [[ "$env_name" =~ [^a-zA-Z0-9_-] ]]; then
+    echo "Error: Invalid environment name. Use only alphanumeric characters, underscores, and hyphens."
+    exit 1
+  fi
+
+  # Get environment path (anchor regex to prevent partial matches)
+  env_path="$(conda env list | grep -E "^${env_name}[[:space:]]+" | awk '{print $NF}')"
+  
+  if [[ -z "$env_path" ]]; then
+    echo "Error: Conda environment '$env_name' not found."
+    echo "Available environments:"
+    conda env list
+    exit 1
+  fi
+
+  if [[ ! -d "$env_path" ]]; then
+    echo "Error: Environment path '$env_path' is not a valid directory."
+    exit 1
+  fi
+
+  # Create activation hook
+  local hook_dir="$env_path/etc/conda/activate.d"
+  mkdir -p "$hook_dir"
+  echo "➡ Adding activation hook → $hook_dir/specstory.sh"
+  get_activation_hook > "$hook_dir/specstory.sh"
+  VENV_HOOKS_ADDED+=("$hook_dir/specstory.sh")
+
+  # Create deactivation hook
+  local deactivate_dir="$env_path/etc/conda/deactivate.d"
+  mkdir -p "$deactivate_dir"
+  echo "➡ Adding deactivation hook → $deactivate_dir/specstory.sh"
+  get_deactivation_hook > "$deactivate_dir/specstory.sh"
+  VENV_HOOKS_ADDED+=("$deactivate_dir/specstory.sh")
+
+  echo "✔ Hooks installed for conda environment: $env_name"
+  echo "➡ Run: conda activate $env_name"
+}
+
+# Create venv hooks
+setup_venv_hooks() {
+  local venv_path="$1"
+  venv_path="${venv_path/#\~/$HOME}"  # Expand ~ if present
+
+  if [[ ! -d "$venv_path" ]]; then
+    echo "Error: Directory '$venv_path' does not exist."
+    exit 1
+  fi
+
+  local activate_script="$venv_path/bin/activate"
+  if [[ ! -f "$activate_script" ]]; then
+    echo "Error: activate script not found at '$activate_script'."
+    exit 1
+  fi
+
+  # Add activation hook if not already present
+  if ! grep -q "# SPECSTORY HOOK START" "$activate_script" 2>/dev/null; then
+    echo "➡ Patching $activate_script"
+    {
+      echo ""
+      echo "# SPECSTORY HOOK START"
+      get_activation_hook
+      echo "# SPECSTORY HOOK END"
+    } >> "$activate_script"
+    VENV_HOOKS_ADDED+=("$activate_script")
+    echo "✔ Activation hook added to $activate_script"
+  else
+    echo "✔ Specstory hook already present in $activate_script"
+  fi
+
+  # Add deactivation hook
+  local deactivate_script="$venv_path/bin/deactivate"
+  if [[ -f "$deactivate_script" ]]; then
+    # Standalone deactivate script exists
+    if ! grep -q "# SPECSTORY DEACTIVATE HOOK" "$deactivate_script" 2>/dev/null; then
+      echo "➡ Patching $deactivate_script"
+      {
+        echo ""
+        echo "# SPECSTORY DEACTIVATE HOOK"
+        get_deactivation_hook
+      } >> "$deactivate_script"
+      VENV_HOOKS_ADDED+=("$deactivate_script")
+      echo "✔ Deactivation hook added to $deactivate_script"
+    else
+      echo "✔ Deactivation hook already present in $deactivate_script"
+    fi
+  else
+    # Patch deactivate function in activate script
+    if ! grep -q "# SPECSTORY DEACTIVATE HOOK" "$activate_script" 2>/dev/null; then
+      if grep -q "^deactivate ()" "$activate_script"; then
+        # macOS sed requires backup extension, Linux doesn't - use empty string for macOS
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+          sed -i '' '/^deactivate ()/,/^}/ {
+            /^}/i\
+    # SPECSTORY DEACTIVATE HOOK\
+    unset -f claude 2>/dev/null || true
+          }' "$activate_script"
+        else
+          sed -i '/^deactivate ()/,/^}/ {
+            /^}/i\
+    # SPECSTORY DEACTIVATE HOOK\
+    unset -f claude 2>/dev/null || true
+          }' "$activate_script"
+        fi
+        if [[ " ${VENV_HOOKS_ADDED[@]} " != *" $activate_script "* ]]; then
+          VENV_HOOKS_ADDED+=("$activate_script")
+        fi
+        echo "✔ Deactivation hook added to deactivate function."
+      else
+        echo "⚠ Could not patch deactivate. Add manually to your deactivate workflow:"
+        echo '   unset -f claude 2>/dev/null || true'
+      fi
+    else
+      echo "✔ Deactivation hook already present."
+    fi
+  fi
+
+  echo "➡ Run: source $activate_script"
+}
+
+# --- Step 6: Virtual environment activation hooks ---
 echo
 echo "═══════════════════════════════════════════════════════════════"
 echo "VIRTUAL ENVIRONMENT SETUP"
@@ -99,152 +479,39 @@ read VENV_CHOICE
 
 case "$VENV_CHOICE" in
   1)
-    # --- Conda ---
-    if ! command -v conda >/dev/null 2>&1; then
-      echo "Error: conda not found in PATH."
-      exit 1
-    fi
-
     echo
     echo "Enter the name of the conda environment where Specstory capture should be active."
     echo "(Example: base or your dev environment name)"
     printf "Environment name: "
     read ENV_NAME
-
-    # Validate environment name
-    if [[ -z "$ENV_NAME" ]] || [[ "$ENV_NAME" =~ [^a-zA-Z0-9_-] ]]; then
-      echo "Error: Invalid environment name. Use only alphanumeric characters, underscores, and hyphens."
-      exit 1
-    fi
-
-    # Validate environment exists and get its path
-    ENV_PATH="$(conda env list | grep -E "^${ENV_NAME}[[:space:]]" | awk '{print $NF}')"
-
-    if [[ -z "$ENV_PATH" ]]; then
-      echo "Conda environment '$ENV_NAME' not found."
-      echo "Available environments:"
-      conda env list
-      exit 1
-    fi
-
-    if [[ ! -d "$ENV_PATH" ]]; then
-      echo "Error: Environment path '$ENV_PATH' is not a valid directory."
-      exit 1
-    fi
-
-    HOOK_DIR="$ENV_PATH/etc/conda/activate.d"
-    mkdir -p "$HOOK_DIR"
-
-    echo "➡ Adding activation hook → $HOOK_DIR/specstory.sh"
-
-    cat > "$HOOK_DIR/specstory.sh" <<'EOF'
-export PATH="$HOME/bin:$PATH"
-alias claude="specstory run claude --no-cloud-sync"
-EOF
-
-    DEACTIVATE_HOOK_DIR="$ENV_PATH/etc/conda/deactivate.d"
-    mkdir -p "$DEACTIVATE_HOOK_DIR"
-
-    echo "➡ Adding deactivation hook → $DEACTIVATE_HOOK_DIR/specstory.sh"
-
-    cat > "$DEACTIVATE_HOOK_DIR/specstory.sh" <<'EOF'
-unalias claude 2>/dev/null || true
-EOF
-
-    echo "✔ Hooks installed for conda environment: $ENV_NAME"
-    echo "➡ Run: conda activate $ENV_NAME"
+    setup_conda_hooks "$ENV_NAME"
     ;;
 
   2)
-    # --- venv / virtualenv ---
     echo
     echo "Enter the full path to your virtual environment directory."
     echo "(Example: /path/to/project/.venv or ~/myproject/venv)"
     printf "Path: "
     read VENV_PATH
-
-    # Expand ~ if present
-    VENV_PATH="${VENV_PATH/#\~/$HOME}"
-
-    if [[ ! -d "$VENV_PATH" ]]; then
-      echo "Error: Directory '$VENV_PATH' does not exist."
-      exit 1
-    fi
-
-    ACTIVATE_SCRIPT="$VENV_PATH/bin/activate"
-    if [[ ! -f "$ACTIVATE_SCRIPT" ]]; then
-      echo "Error: activate script not found at '$ACTIVATE_SCRIPT'."
-      exit 1
-    fi
-
-    # Check if already patched
-    if grep -q "# SPECSTORY HOOK START" "$ACTIVATE_SCRIPT" 2>/dev/null; then
-      echo "✔ Specstory hook already present in $ACTIVATE_SCRIPT"
-    else
-      echo "➡ Patching $ACTIVATE_SCRIPT"
-
-      cat >> "$ACTIVATE_SCRIPT" <<'EOF'
-
-# SPECSTORY HOOK START
-export PATH="$HOME/bin:$PATH"
-alias claude="specstory run claude --no-cloud-sync"
-# SPECSTORY HOOK END
-EOF
-
-      echo "✔ Activation hook added to $ACTIVATE_SCRIPT"
-    fi
-
-    # Patch deactivate script if it exists, otherwise patch the deactivate function in activate
-    DEACTIVATE_SCRIPT="$VENV_PATH/bin/deactivate"
-    if [[ -f "$DEACTIVATE_SCRIPT" ]]; then
-      # Standalone deactivate script exists
-      if grep -q "# SPECSTORY DEACTIVATE HOOK" "$DEACTIVATE_SCRIPT" 2>/dev/null; then
-        echo "✔ Deactivation hook already present in $DEACTIVATE_SCRIPT"
-      else
-        echo "➡ Patching $DEACTIVATE_SCRIPT"
-        cat >> "$DEACTIVATE_SCRIPT" <<'EOF'
-
-# SPECSTORY DEACTIVATE HOOK
-unalias claude 2>/dev/null || true
-EOF
-        echo "✔ Deactivation hook added to $DEACTIVATE_SCRIPT"
-      fi
-    else
-      # No standalone deactivate script, patch the deactivate function in activate
-      if grep -q "# SPECSTORY DEACTIVATE HOOK" "$ACTIVATE_SCRIPT" 2>/dev/null; then
-        echo "✔ Deactivation hook already present."
-      else
-        # Insert unalias into the deactivate function
-        if grep -q "^deactivate ()" "$ACTIVATE_SCRIPT"; then
-          sed -i.bak '/^deactivate ()/,/^}/ {
-            /^}/i\
-    # SPECSTORY DEACTIVATE HOOK\
-    unalias claude 2>/dev/null || true
-          }' "$ACTIVATE_SCRIPT"
-          rm -f "$ACTIVATE_SCRIPT.bak"
-          echo "✔ Deactivation hook added to deactivate function."
-        else
-          echo "⚠ Could not patch deactivate. Add manually to your deactivate workflow:"
-          echo '   unalias claude 2>/dev/null || true'
-        fi
-      fi
-    fi
-
-    echo "➡ Run: source $ACTIVATE_SCRIPT"
+    setup_venv_hooks "$VENV_PATH"
     ;;
 
   3)
-    # --- Manual / None ---
     echo
     echo "Manual setup instructions:"
     echo "─────────────────────────────────────────────────────────────"
     echo "Add the following lines to your shell profile or activate script:"
     echo
-    echo '  export PATH="$HOME/bin:$PATH"'
-    echo '  alias claude="specstory run claude --no-cloud-sync"'
+    echo "  $PATH_EXPORT"
+    echo "  claude() {"
+    echo "    # Filter \$HOME/bin from PATH to avoid infinite recursion"
+    echo "    local filtered_path"
+    echo "    filtered_path=\"\$(echo \"\$PATH\" | tr ':' '\\n' | grep -v \"^\${HOME}/bin\\\$\" | tr '\\n' ':' | sed 's/:\$//')\""
+    echo "    PATH=\"\$filtered_path\" specstory run claude --no-cloud-sync \"\$@\""
+    echo "  }"
     echo
-    echo "To remove the alias when deactivating, add:"
-    echo '  unalias claude 2>/dev/null || true'
+    echo "To remove the function when deactivating, add:"
+    echo "  unset -f claude 2>/dev/null || true"
     echo "─────────────────────────────────────────────────────────────"
     ;;
 
@@ -254,8 +521,49 @@ EOF
     ;;
 esac
 
+# ============================================================================
+# Installation Complete
+# ============================================================================
+
+# Disable cleanup trap on successful completion
+trap - INT
+
 echo
 echo "Installation complete!"
 echo "Your Specstory wrapper is ready."
-echo "Restart your terminal or 'source ~/.zshrc' / 'source ~/.bashrc' if needed."
+
+# Final verification
+echo "➡ Verifying installation..."
+
+# Check wrapper files exist and are executable
+if [[ ! -x "$WRAPPER_BIN" ]]; then
+  echo "⚠ Warning: $WRAPPER_BIN is not executable"
+fi
+if [[ ! -x "$CLAUDE_WRAPPER_BIN" ]]; then
+  echo "⚠ Warning: $CLAUDE_WRAPPER_BIN is not executable"
+fi
+if [[ ! -f "$PYTHON_WRAPPER" ]]; then
+  echo "⚠ Warning: $PYTHON_WRAPPER was not installed"
+fi
+
+# Check PATH
+CURRENT_CLAUDE="$(command -v claude || true)"
+if [[ "$CURRENT_CLAUDE" != "$HOME/bin/claude" ]]; then
+  echo "⚠ Warning: 'claude' command points to $CURRENT_CLAUDE"
+  echo "   It should point to $HOME/bin/claude for SpecStory to work."
+  echo "   Please restart your terminal or run: export PATH=\"\$HOME/bin:\$PATH\""
+else
+  echo "✔ 'claude' command correctly points to your wrapper."
+fi
+
+CURRENT_SPECSTORY="$(command -v specstory || true)"
+if [[ "$CURRENT_SPECSTORY" != "$HOME/bin/specstory" ]]; then
+  echo "⚠ Warning: 'specstory' command points to $CURRENT_SPECSTORY"
+  echo "   After restarting your terminal, it should point to $HOME/bin/specstory"
+else
+  echo "✔ 'specstory' command correctly points to your wrapper."
+fi
+
+echo
+echo "Restart your terminal or 'source ~/.zshrc' / 'source ~/.bashrc' to apply changes."
 echo
